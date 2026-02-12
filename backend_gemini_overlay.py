@@ -1,13 +1,11 @@
-# backend_gemini_overlay.py
-# Virtual Try-On – Hardened (Refactored + Scores + Stable Deployment)
-
 import os
+os.environ["ORT_LOGGING_LEVEL"] = "3"  # suppress onnxruntime GPU warning
+
 import io
 import uuid
 import traceback
 from typing import Dict, Any, List, Tuple, Optional
 import requests
-import cv2
 import numpy as np
 from PIL import Image, ImageOps
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
@@ -15,11 +13,33 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
-from rembg import remove
-import replicate
 import anyio
 
-# ── Google GenAI SDK (safe import) ────────────────────────────────
+# Safe cv2 import
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("[WARN] cv2 not available")
+
+# Safe rembg import
+try:
+    from rembg import remove as rembg_remove
+    REMBG_AVAILABLE = True
+except Exception as e:
+    REMBG_AVAILABLE = False
+    print(f"[WARN] rembg not available: {e}")
+
+# Safe replicate import
+try:
+    import replicate
+    REPLICATE_AVAILABLE = True
+except Exception as e:
+    REPLICATE_AVAILABLE = False
+    print(f"[WARN] replicate not available: {e}")
+
+# Safe Google GenAI import
 try:
     from google import genai
     from google.genai import types
@@ -417,5 +437,6 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=port, reload=True, log_level="info")
+
 
 
