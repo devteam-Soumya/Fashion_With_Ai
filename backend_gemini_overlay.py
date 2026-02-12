@@ -56,7 +56,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "").strip()
 ENABLE_GEMINI       = os.getenv("ENABLE_GEMINI", "true").lower() in ("true", "1", "yes")
-GEMINI_MODEL        = os.getenv("GEMINI_MODEL_ID", "gemini-1.5-flash")  # safe default
+GEMINI_MODEL        = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")  # safe default
 
 # Use active IDM-VTON model (Feb 2026)
 ENABLE_IDM_VTON     = os.getenv("ENABLE_IDM_VTON", "true").lower() in ("true", "1", "yes")
@@ -437,6 +437,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=port, reload=True, log_level="info")
+
 
 
 
