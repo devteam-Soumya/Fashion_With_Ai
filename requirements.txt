@@ -12,3 +12,5 @@ mediapipe
 rembg
 onnxruntime
 streamlit
+google-genai
+
