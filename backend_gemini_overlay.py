@@ -1,10 +1,16 @@
+# backend_gemini_overlay.py
+# Virtual Try-On – Hardened (Refactored + Scores + Stable Deployment)
+
 import os
-os.environ["ORT_LOGGING_LEVEL"] = "3"  # suppress onnxruntime GPU warning
+# ── Suppress onnxruntime GPU warning (no GPU on Render) ──
+os.environ["ORT_LOGGING_LEVEL"] = "3"
+os.environ["ORT_DISABLE_GPU"] = "1"
 
 import io
 import uuid
 import traceback
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Optional
+
 import requests
 import numpy as np
 from PIL import Image, ImageOps
@@ -15,59 +21,64 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 import anyio
 
-# Safe cv2 import
+# ── Safe cv2 import ────────────────────────────────────────────────
 try:
     import cv2
     CV2_AVAILABLE = True
-except ImportError:
+except Exception as e:
     CV2_AVAILABLE = False
-    print("[WARN] cv2 not available")
+    print(f"[WARN] cv2 not available: {e}")
 
-# Safe rembg import
+# ── Safe rembg import ──────────────────────────────────────────────
 try:
     from rembg import remove as rembg_remove
     REMBG_AVAILABLE = True
+    print("[OK] rembg loaded")
 except Exception as e:
     REMBG_AVAILABLE = False
     print(f"[WARN] rembg not available: {e}")
 
-# Safe replicate import
+# ── Safe replicate import ──────────────────────────────────────────
 try:
     import replicate
     REPLICATE_AVAILABLE = True
+    print("[OK] replicate loaded")
 except Exception as e:
     REPLICATE_AVAILABLE = False
     print(f"[WARN] replicate not available: {e}")
 
-# Safe Google GenAI import
+# ── Safe Google GenAI import ───────────────────────────────────────
 try:
     from google import genai
     from google.genai import types
     GEMINI_SDK_AVAILABLE = True
-except ImportError:
+    print("[OK] google-genai loaded")
+except Exception as e:
     GEMINI_SDK_AVAILABLE = False
+    print(f"[WARN] google-genai not available: {e}")
 
 load_dotenv()
 
-# ── CONFIG ──────────────────────────────────────────
+# ── CONFIG ─────────────────────────────────────────────────────────
 OUTPUT_DIR = "./outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "").strip()
 ENABLE_GEMINI       = os.getenv("ENABLE_GEMINI", "true").lower() in ("true", "1", "yes")
-GEMINI_MODEL        = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")  # safe default
-
-# Use active IDM-VTON model (Feb 2026)
+GEMINI_MODEL        = os.getenv("GEMINI_MODEL_ID", "gemini-1.5-flash")
 ENABLE_IDM_VTON     = os.getenv("ENABLE_IDM_VTON", "true").lower() in ("true", "1", "yes")
-IDM_MODEL           = "yisol/IDM-VTON"  # current public & working version
+IDM_MODEL           = "yisol/IDM-VTON"
 
 if REPLICATE_API_TOKEN:
     os.environ["REPLICATE_API_TOKEN"] = REPLICATE_API_TOKEN
 
-# ── APP ─────────────────────────────────────────────
+# ── APP ────────────────────────────────────────────────────────────
+print("[STARTUP] Initializing FastAPI app...")
 app = FastAPI(title="Virtual Try-On – Hardened (Stable Deployment)")
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+print("[STARTUP] FastAPI app initialized, mounting static files...")
+
 
 class RequestIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -76,53 +87,67 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         response.headers["X-Request-Id"] = request.state.request_id
         return response
 
+
 app.add_middleware(RequestIdMiddleware)
 
-# ── Gemini client (safe) ───────────────────────────────────
-gemini_client: Optional[genai.Client] = None
+# ── Gemini client (safe) ───────────────────────────────────────────
+gemini_client: Optional[Any] = None  # type: Any to avoid genai reference when not imported
 if ENABLE_GEMINI and GEMINI_SDK_AVAILABLE and GEMINI_API_KEY:
     try:
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        print(f"Gemini enabled: {GEMINI_MODEL}")
+        print(f"[OK] Gemini enabled: {GEMINI_MODEL}")
     except Exception as e:
         gemini_client = None
-        print(f"Gemini init failed: {e}")
+        print(f"[WARN] Gemini init failed: {e}")
 else:
-    print("Gemini disabled")
+    print("[INFO] Gemini disabled or SDK not available")
 
-print(f"IDM-VTON enabled: {ENABLE_IDM_VTON}")
+print(f"[INFO] IDM-VTON enabled: {ENABLE_IDM_VTON}")
+print(f"[INFO] Replicate available: {REPLICATE_AVAILABLE}")
+print("[STARTUP] App fully loaded and ready.")
 
-# ── UTILS ───────────────────────────────────────────
+# ── UTILS ──────────────────────────────────────────────────────────
 def bytes_to_rgb(data: bytes) -> np.ndarray:
     try:
         img = Image.open(io.BytesIO(data)).convert("RGB")
-        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        if CV2_AVAILABLE:
+            return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        return np.array(img)
     except Exception as e:
         raise ValueError(f"Invalid image data: {e}")
 
+
 def bgr_to_pil(bgr: np.ndarray) -> Image.Image:
-    return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    if CV2_AVAILABLE:
+        return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    return Image.fromarray(bgr)
+
 
 def save_jpeg(bgr: np.ndarray, path: str):
     bgr_to_pil(bgr).save(path, "JPEG", quality=92, optimize=True)
+
 
 def get_url(request: Request, fname: str) -> str:
     base = str(request.base_url).rstrip("/")
     return f"{base}/outputs/{fname}"
 
+
 def safe_output_path(filename: str) -> str:
     fname = os.path.basename(filename)
     return os.path.join(OUTPUT_DIR, fname)
+
 
 def build_download_url(request: Request, filename: str) -> str:
     base = str(request.base_url).rstrip("/")
     return f"{base}/download/{filename}"
 
+
 def build_view_url(request: Request, filename: str) -> str:
     base = str(request.base_url).rstrip("/")
     return f"{base}/view/{filename}"
 
-# ── Download + View endpoints ───────────────────────
+
+# ── Download + View endpoints ──────────────────────────────────────
 @app.get("/download/{filename}")
 def download_output(request: Request, filename: str):
     path = safe_output_path(filename)
@@ -134,6 +159,7 @@ def download_output(request: Request, filename: str):
         filename=os.path.basename(filename),
         headers={"Cache-Control": "no-store"},
     )
+
 
 @app.get("/view/{filename}")
 def view_output(request: Request, filename: str):
@@ -151,10 +177,13 @@ def view_output(request: Request, filename: str):
         <title>Try-On Result</title>
         <style>
           body {{ font-family: Arial, sans-serif; margin: 24px; background: #f9f9f9; }}
-          .wrap {{ max-width: 900px; margin: 0 auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
-          img {{ width: 100%; height: auto; border-radius: 12px; box-shadow: 0 6px 18px rgba(0,0,0,0.15); }}
+          .wrap {{ max-width: 900px; margin: 0 auto; background: white; padding: 20px;
+                   border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
+          img {{ width: 100%; height: auto; border-radius: 12px;
+                 box-shadow: 0 6px 18px rgba(0,0,0,0.15); }}
           .btns {{ margin-top: 20px; display: flex; gap: 12px; flex-wrap: wrap; }}
-          a.button {{ display: inline-block; padding: 12px 18px; border-radius: 10px; text-decoration: none; font-weight: bold; }}
+          a.button {{ display: inline-block; padding: 12px 18px; border-radius: 10px;
+                      text-decoration: none; font-weight: bold; }}
           a.primary {{ background: #007bff; color: white; }}
           a.secondary {{ background: #6c757d; color: white; }}
         </style>
@@ -173,7 +202,8 @@ def view_output(request: Request, filename: str):
     """
     return HTMLResponse(html)
 
-# ── Gemini description (safe) ───────────────────────
+
+# ── Gemini description (safe) ──────────────────────────────────────
 def gemini_describe(garment_rgba: Image.Image) -> str:
     if not gemini_client:
         return "garment"
@@ -191,10 +221,11 @@ def gemini_describe(garment_rgba: Image.Image) -> str:
         )
         return (response.text or "garment").strip()
     except Exception as e:
-        print(f"Gemini describe failed: {e}")
+        print(f"[WARN] Gemini describe failed: {e}")
         return "garment"
 
-# ── Overlay fallback ───────────────────────────────
+
+# ── Overlay fallback ───────────────────────────────────────────────
 def overlay(user_bgr: np.ndarray, garment_rgba: Image.Image) -> np.ndarray:
     out = user_bgr.copy()
     h, w = out.shape[:2]
@@ -218,10 +249,13 @@ def overlay(user_bgr: np.ndarray, garment_rgba: Image.Image) -> np.ndarray:
     out[y0:y1, x0:x1] = (region * (1 - alpha) + g_bgr * alpha).astype(np.uint8)
     return out
 
-# ── IDM-VTON generation (safe) ─────────────────────
+
+# ── IDM-VTON generation (safe) ─────────────────────────────────────
 def idm_vton_generate(person_pil: Image.Image, garment_pil: Image.Image, desc: str) -> Image.Image:
     if not ENABLE_IDM_VTON:
-        raise RuntimeError("IDM-VTON disabled")
+        raise RuntimeError("IDM-VTON disabled via env")
+    if not REPLICATE_AVAILABLE:
+        raise RuntimeError("replicate package not available")
 
     person_bytes = io.BytesIO()
     garment_bytes = io.BytesIO()
@@ -256,7 +290,8 @@ def idm_vton_generate(person_pil: Image.Image, garment_pil: Image.Image, desc: s
             return Image.open(io.BytesIO(img_data)).convert("RGB")
     raise RuntimeError(f"Unexpected Replicate output: {type(out)}")
 
-# ── Unified response builder ───────────────────────
+
+# ── Unified response builder ───────────────────────────────────────
 def make_response(
     request: Request,
     request_id: str,
@@ -291,7 +326,8 @@ def make_response(
         "output_view_urls": output_view_urls,
     }
 
-# ── Core pipeline ───────────────────────────────────
+
+# ── Core pipeline ──────────────────────────────────────────────────
 def run_pipeline(
     request: Request,
     user_bgr: np.ndarray,
@@ -308,23 +344,25 @@ def run_pipeline(
         # Garment processing
         garment_rgba = bgr_to_pil(garment_bgr).convert("RGBA")
         try:
-            garment_rgba = remove(garment_rgba).convert("RGBA")
+            if REMBG_AVAILABLE:
+                garment_rgba = rembg_remove(garment_rgba).convert("RGBA")
+            else:
+                warnings.append("rembg not available, skipping background removal")
         except Exception as e:
             warnings.append(f"Background removal failed: {type(e).__name__}")
             garment_rgba = bgr_to_pil(garment_bgr).convert("RGBA")
 
         desc = garment_des.strip() or (gemini_describe(garment_rgba) if gemini_client else "garment")
 
-        # User processing
-        user_crop = user_bgr  # simple for now
+        user_crop = user_bgr
 
         # Try IDM-VTON if enabled and preferred
-        if prefer_idm and ENABLE_IDM_VTON:
+        if prefer_idm and ENABLE_IDM_VTON and REPLICATE_AVAILABLE:
             try:
                 white = Image.new("RGBA", garment_rgba.size, (255, 255, 255, 255))
                 garment_rgb = Image.alpha_composite(white, garment_rgba).convert("RGB")
                 out_pil = idm_vton_generate(bgr_to_pil(user_crop), garment_rgb, desc)
-                out_bgr = cv2.cvtColor(np.array(out_pil), cv2.COLOR_RGB2BGR)
+                out_bgr = cv2.cvtColor(np.array(out_pil), cv2.COLOR_RGB2BGR) if CV2_AVAILABLE else np.array(out_pil)
                 return make_response(
                     request, request_id, True, "idm-vton", desc,
                     warnings, diagnostics, out_bgr=out_bgr
@@ -340,7 +378,8 @@ def run_pipeline(
         )
 
     except Exception as e:
-        print(f"[{request_id}] Pipeline error: {type(e).__name__} – {e}")
+        tb = traceback.format_exc()
+        print(f"[{request_id}] Pipeline error: {type(e).__name__} – {e}\n{tb}")
         return make_response(
             request, request_id, False, "error", garment_des or "garment",
             warnings + [f"Processing failed: {str(e)[:100]}"],
@@ -348,7 +387,8 @@ def run_pipeline(
             error={"type": type(e).__name__, "message": str(e)}
         )
 
-# ── ENDPOINTS ───────────────────────────────────────
+
+# ── ENDPOINTS ──────────────────────────────────────────────────────
 @app.post("/v1/tryon/garment-to-user")
 async def garment_to_user(
     request: Request,
@@ -370,14 +410,9 @@ async def garment_to_user(
         })
 
     return await anyio.to_thread.run_sync(
-        run_pipeline,
-        request,
-        user_bgr,
-        garment_bgr,
-        garment_des,
-        bool(prefer_idm),
-        "garment"
+        lambda: run_pipeline(request, user_bgr, garment_bgr, garment_des, bool(prefer_idm), "garment")
     )
+
 
 @app.post("/v1/tryon/actress-to-user")
 async def actress_to_user(
@@ -400,29 +435,35 @@ async def actress_to_user(
         })
 
     return await anyio.to_thread.run_sync(
-        run_pipeline,
-        request,
-        user_bgr,
-        actress_bgr,
-        garment_des,
-        bool(prefer_idm),
-        "actress"
+        lambda: run_pipeline(request, user_bgr, actress_bgr, garment_des, bool(prefer_idm), "actress")
     )
+
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
+        "python_version": os.sys.version,
         "gemini_enabled": bool(gemini_client),
         "idm_vton_enabled": ENABLE_IDM_VTON,
+        "replicate_available": REPLICATE_AVAILABLE,
+        "rembg_available": REMBG_AVAILABLE,
+        "cv2_available": CV2_AVAILABLE,
         "endpoints": ["/v1/tryon/garment-to-user", "/v1/tryon/actress-to-user"]
     }
 
-# ── Global exception handler ───────────────────────
+
+@app.get("/")
+def root():
+    return {"ok": True, "message": "Virtual Try-On API is running", "docs": "/docs"}
+
+
+# ── Global exception handler ───────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     request_id = getattr(request.state, "request_id", "unknown")
     print(f"[{request_id}] Unhandled exception: {exc}")
+    traceback.print_exc()
     return JSONResponse(
         status_code=200,
         content={
@@ -433,11 +474,16 @@ async def global_exception_handler(request: Request, exc: Exception):
         }
     )
 
+
+# ── Entry point ────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=port, reload=True, log_level="info")
-
-
-
-
+    print(f"[STARTUP] Binding to 0.0.0.0:{port}")
+    uvicorn.run(
+        "backend_gemini_overlay:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        log_level="info"
+    )
