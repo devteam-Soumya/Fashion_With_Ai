@@ -1,9 +1,10 @@
 # backend_gemini_overlay.py
 # Virtual Try-On – Hardened (Refactored + Scores)
-# Adds: output_view_urls + output_download_urls for easy viewing/downloading
+# Production-ready version with proper error handling and logging
 
 import os
 import io
+import sys
 import uuid
 import traceback
 from dataclasses import dataclass
@@ -21,20 +22,25 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from dotenv import load_dotenv
-load_dotenv()
+# ─────────────────────────────
+# STARTUP LOGGING
+# ─────────────────────────────
+print("=" * 60, file=sys.stderr, flush=True)
+print("🚀 INITIALIZING VIRTUAL TRY-ON SERVICE", file=sys.stderr, flush=True)
+print("=" * 60, file=sys.stderr, flush=True)
+print(f"Python: {sys.version}", file=sys.stderr, flush=True)
+print(f"Working Dir: {os.getcwd()}", file=sys.stderr, flush=True)
+print(f"PORT env: {os.getenv('PORT', 'NOT SET')}", file=sys.stderr, flush=True)
 
-from ultralytics import YOLO
-from rembg import remove
-import mediapipe as mp
-
-# ✅ NEW Gemini SDK (google-genai)
-# pip install -U google-genai
-from google import genai
-from google.genai import types
-
-import replicate
-
+# ─────────────────────────────
+# LOAD ENV VARS
+# ─────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("✅ Environment loaded", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"⚠️ dotenv load failed (continuing): {e}", file=sys.stderr, flush=True)
 
 # ─────────────────────────────
 # CONFIG
@@ -47,16 +53,23 @@ ENABLE_IDM_VTON = os.getenv("ENABLE_IDM_VTON", "1") == "1"
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 REPLICATE_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
-
-# Change if you want a different model:
 GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
 
-app = FastAPI(title="Virtual Try-On – Hardened (Refactored + Scores)")
-app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
-
+# Set YOLO config to writable location
+YOLO_CONFIG_DIR = os.getenv("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
+os.makedirs(YOLO_CONFIG_DIR, exist_ok=True)
+os.environ["YOLO_CONFIG_DIR"] = YOLO_CONFIG_DIR
+print(f"✅ YOLO config dir: {YOLO_CONFIG_DIR}", file=sys.stderr, flush=True)
 
 # ─────────────────────────────
-# Request ID middleware
+# INITIALIZE FASTAPI APP
+# ─────────────────────────────
+app = FastAPI(title="Virtual Try-On – Hardened (Refactored + Scores)")
+app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+print("✅ FastAPI app created", file=sys.stderr, flush=True)
+
+# ─────────────────────────────
+# REQUEST ID MIDDLEWARE
 # ─────────────────────────────
 class RequestIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -67,51 +80,103 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RequestIdMiddleware)
 
+# ─────────────────────────────
+# IMPORT AND INITIALIZE MODELS
+# ─────────────────────────────
+print("📦 Loading ML libraries...", file=sys.stderr, flush=True)
+
+try:
+    from ultralytics import YOLO
+    print("✅ Ultralytics imported", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"❌ Ultralytics import failed: {e}", file=sys.stderr, flush=True)
+    raise
+
+try:
+    from rembg import remove
+    print("✅ rembg imported", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"❌ rembg import failed: {e}", file=sys.stderr, flush=True)
+    raise
+
+try:
+    import mediapipe as mp
+    print("✅ mediapipe imported", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"❌ mediapipe import failed: {e}", file=sys.stderr, flush=True)
+    raise
+
+# Initialize YOLO
+try:
+    print("📥 Downloading/loading YOLO model (may take 30-60s first time)...", file=sys.stderr, flush=True)
+    yolo = YOLO("yolov8n-seg.pt")
+    print("✅ YOLO model loaded successfully", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"❌ YOLO initialization failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    traceback.print_exc()
+    raise
+
+# Initialize MediaPipe Pose
+try:
+    print("📥 Loading MediaPipe Pose...", file=sys.stderr, flush=True)
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=True, model_complexity=1, enable_segmentation=False)
+    print("✅ MediaPipe Pose loaded", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"❌ MediaPipe Pose failed: {e}", file=sys.stderr, flush=True)
+    raise
+
+# Initialize MediaPipe Face Detection
+try:
+    print("📥 Loading MediaPipe Face Detection...", file=sys.stderr, flush=True)
+    mp_face = mp.solutions.face_detection
+    face_det = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+    print("✅ MediaPipe Face Detection loaded", file=sys.stderr, flush=True)
+except Exception as e:
+    print(f"❌ MediaPipe Face Detection failed: {e}", file=sys.stderr, flush=True)
+    raise
 
 # ─────────────────────────────
-# Gemini setup (optional) - NEW SDK
+# GEMINI SETUP (optional)
 # ─────────────────────────────
-gemini_client: Optional[genai.Client] = None
+gemini_client: Optional[Any] = None
 if ENABLE_GEMINI and GEMINI_KEY:
     try:
+        from google import genai
+        from google.genai import types
         gemini_client = genai.Client(api_key=GEMINI_KEY)
-        print("✅ Gemini enabled (google-genai)")
+        print("✅ Gemini enabled (google-genai)", file=sys.stderr, flush=True)
     except Exception as e:
         gemini_client = None
-        print(f"⚠️ Gemini init failed ({type(e).__name__}). Disabling Gemini.")
+        print(f"⚠️ Gemini init failed ({type(e).__name__}). Disabling Gemini.", file=sys.stderr, flush=True)
 else:
-    print("ℹ️ Gemini disabled")
-
+    print("ℹ️ Gemini disabled", file=sys.stderr, flush=True)
 
 # ─────────────────────────────
-# Replicate setup (optional)
+# REPLICATE SETUP (optional)
 # ─────────────────────────────
 idm_vton_ready = False
 if ENABLE_IDM_VTON:
     if not REPLICATE_TOKEN:
-        print("⚠️ IDM-VTON requested but REPLICATE_API_TOKEN missing. Disabling IDM-VTON.")
+        print("⚠️ IDM-VTON requested but REPLICATE_API_TOKEN missing. Disabling IDM-VTON.", file=sys.stderr, flush=True)
     else:
-        os.environ["REPLICATE_API_TOKEN"] = REPLICATE_TOKEN
-        idm_vton_ready = True
-        print("✅ IDM-VTON enabled via Replicate")
+        try:
+            import replicate
+            os.environ["REPLICATE_API_TOKEN"] = REPLICATE_TOKEN
+            idm_vton_ready = True
+            print("✅ IDM-VTON enabled via Replicate", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"⚠️ Replicate import failed: {e}", file=sys.stderr, flush=True)
 else:
-    print("ℹ️ IDM-VTON disabled (overlay only)")
+    print("ℹ️ IDM-VTON disabled (overlay only)", file=sys.stderr, flush=True)
+
+print("=" * 60, file=sys.stderr, flush=True)
+print("✅ ALL MODELS LOADED SUCCESSFULLY", file=sys.stderr, flush=True)
+print("=" * 60, file=sys.stderr, flush=True)
 
 
 # ─────────────────────────────
-# Models
-# ─────────────────────────────
-yolo = YOLO("yolov8n-seg.pt")
-
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=True, model_complexity=1, enable_segmentation=False)
-
-mp_face = mp.solutions.face_detection
-face_det = mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5)
-
-
-# ─────────────────────────────
-# Utils
+# UTILITY FUNCTIONS
 # ─────────────────────────────
 def clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
@@ -131,7 +196,6 @@ def build_url(request: Request, filename: str) -> str:
     return f"{base}/outputs/{filename}"
 
 def safe_output_path(filename: str) -> str:
-    # Prevent path traversal (e.g., ../../secret)
     fname = os.path.basename(filename)
     return os.path.join(OUTPUT_DIR, fname)
 
@@ -145,15 +209,14 @@ def build_view_url(request: Request, filename: str) -> str:
 
 
 # ─────────────────────────────
-# Download + View endpoints
+# ENDPOINTS: DOWNLOAD & VIEW
 # ─────────────────────────────
 @app.get("/download/{filename}")
 def download_output(request: Request, filename: str):
     path = safe_output_path(filename)
     if not os.path.exists(path):
         return JSONResponse(status_code=404, content={"ok": False, "error": "file_not_found"})
-
-    # Forces download (Content-Disposition: attachment)
+    
     return FileResponse(
         path=path,
         media_type="image/jpeg",
@@ -166,10 +229,10 @@ def view_output(request: Request, filename: str):
     path = safe_output_path(filename)
     if not os.path.exists(path):
         return HTMLResponse("<h3>File not found</h3>", status_code=404)
-
+    
     img_url = build_url(request, os.path.basename(filename))
     dl_url = build_download_url(request, os.path.basename(filename))
-
+    
     html = f"""
     <!doctype html>
     <html>
@@ -205,17 +268,17 @@ def view_output(request: Request, filename: str):
 
 
 # ─────────────────────────────
-# Detection helpers
+# DETECTION HELPERS
 # ─────────────────────────────
 def get_person_bbox(bgr: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     try:
         r = yolo.predict(source=bgr, verbose=False)[0]
     except Exception:
         return None
-
+    
     if r.boxes is None or len(r.boxes) == 0:
         return None
-
+    
     best, best_area = None, 0
     for i in range(len(r.boxes)):
         try:
@@ -224,34 +287,34 @@ def get_person_bbox(bgr: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
             x1, y1, x2, y2 = map(int, r.boxes.xyxy[i])
         except Exception:
             continue
-
+        
         area = max(0, x2 - x1) * max(0, y2 - y1)
         if area > best_area:
             best_area = area
             best = (x1, y1, x2, y2)
-
+    
     return best
 
 def crop_person(bgr: np.ndarray) -> np.ndarray:
     bb = get_person_bbox(bgr)
     if not bb:
         return bgr
-
+    
     x1, y1, x2, y2 = bb
     h, w = bgr.shape[:2]
     pad = int(0.08 * max(h, w))
-
+    
     x1 = max(0, x1 - pad)
     y1 = max(0, y1 - pad)
     x2 = min(w, x2 + pad)
     y2 = min(h, y2 + pad)
-
+    
     crop = bgr[y1:y2, x1:x2].copy()
     return crop if crop.size else bgr
 
 
 # ─────────────────────────────
-# Input diagnostics (safe)
+# INPUT DIAGNOSTICS
 # ─────────────────────────────
 def detect_face(bgr: np.ndarray) -> Dict[str, Any]:
     try:
@@ -267,11 +330,11 @@ def estimate_body_coverage(bgr: np.ndarray) -> Dict[str, Any]:
     bb = get_person_bbox(bgr)
     if not bb:
         return {"person_detected": False, "body_coverage": "none", "bbox_area_ratio": 0.0}
-
+    
     x1, y1, x2, y2 = bb
     bbox_area = max(0, x2 - x1) * max(0, y2 - y1)
     ratio = float(bbox_area / max(1, h * w))
-
+    
     if ratio < 0.08:
         cov = "tiny_person"
     elif ratio < 0.20:
@@ -280,7 +343,7 @@ def estimate_body_coverage(bgr: np.ndarray) -> Dict[str, Any]:
         cov = "torso"
     else:
         cov = "full_or_close"
-
+    
     return {"person_detected": True, "body_coverage": cov, "bbox_area_ratio": round(ratio, 3)}
 
 def estimate_orientation_from_pose(bgr: np.ndarray) -> str:
@@ -289,13 +352,13 @@ def estimate_orientation_from_pose(bgr: np.ndarray) -> str:
         res = pose.process(rgb)
         if not res.pose_landmarks:
             return "unknown"
-
+        
         lm = res.pose_landmarks.landmark
         ls = float(lm[mp_pose.PoseLandmark.LEFT_SHOULDER].visibility)
         rs = float(lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].visibility)
         lh = float(lm[mp_pose.PoseLandmark.LEFT_HIP].visibility)
         rh = float(lm[mp_pose.PoseLandmark.RIGHT_HIP].visibility)
-
+        
         diff = abs(ls - rs) + abs(lh - rh)
         return "profile_or_turned" if diff > 0.9 else "frontish"
     except Exception:
@@ -305,10 +368,10 @@ def build_input_diagnostics(bgr: np.ndarray) -> Dict[str, Any]:
     h, w = bgr.shape[:2]
     cov = estimate_body_coverage(bgr)
     face = detect_face(bgr)
-
+    
     short_side = min(h, w)
     low_res = short_side < 512
-
+    
     return {
         "image_size": {"width": w, "height": h},
         "low_resolution": low_res,
@@ -320,7 +383,7 @@ def build_input_diagnostics(bgr: np.ndarray) -> Dict[str, Any]:
 
 
 # ─────────────────────────────
-# Pose assessment (graded; NEVER throws)
+# POSE ASSESSMENT
 # ─────────────────────────────
 @dataclass
 class PoseAssessment:
@@ -336,38 +399,38 @@ def assess_pose(user_bgr: np.ndarray) -> PoseAssessment:
         res = pose.process(rgb)
     except Exception:
         return PoseAssessment(False, False, False, 0.15, ["Pose estimation failed internally."])
-
+    
     if not res.pose_landmarks:
         return PoseAssessment(False, False, False, 0.20, ["No pose detected (use clearer, front-facing photo)."])
-
+    
     lm = res.pose_landmarks.landmark
     shoulders = [mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.RIGHT_SHOULDER]
     hips = [mp_pose.PoseLandmark.LEFT_HIP, mp_pose.PoseLandmark.RIGHT_HIP]
-
+    
     sh_vis = [float(lm[i].visibility) for i in shoulders]
     hip_vis = [float(lm[i].visibility) for i in hips]
-
+    
     shoulders_ok = all(v >= 0.55 for v in sh_vis)
     hips_ok = all(v >= 0.55 for v in hip_vis)
-
+    
     reasons: List[str] = []
     if not shoulders_ok:
         reasons.append("Shoulders not clearly visible.")
     if not hips_ok:
         reasons.append("Hips not clearly visible.")
-
+    
     score = 0.35 + 0.25 * (sum(sh_vis) / 2.0) + 0.25 * (sum(hip_vis) / 2.0)
     h, w = user_bgr.shape[:2]
     if min(h, w) < 512:
         score -= 0.10
         reasons.append("Low resolution (short side < 512px).")
-
+    
     score = float(max(0.0, min(score, 0.98)))
     return PoseAssessment(True, shoulders_ok and hips_ok, shoulders_ok, score, reasons)
 
 
 # ─────────────────────────────
-# Garment cutout (safe)
+# GARMENT PROCESSING
 # ─────────────────────────────
 def garment_cutout_rgba_safe(garment_bgr: np.ndarray) -> Tuple[Image.Image, List[str]]:
     warnings: List[str] = []
@@ -379,14 +442,12 @@ def garment_cutout_rgba_safe(garment_bgr: np.ndarray) -> Tuple[Image.Image, List
         return bgr_to_pil(garment_bgr).convert("RGBA"), warnings
 
 def compute_garment_score(garment_rgba: Image.Image) -> float:
-    """Simple quality proxy: alpha coverage not too tiny, not too full."""
     try:
         g = np.array(garment_rgba)
         if g.ndim != 3 or g.shape[2] != 4:
             return 0.25
         alpha = g[:, :, 3].astype(np.float32) / 255.0
-        cov = float(np.mean(alpha > 0.15))  # % of pixels that are garment
-        # ideal-ish ~ 0.20–0.55 for product cutouts; penalize extremes
+        cov = float(np.mean(alpha > 0.15))
         score = 1.0 - min(abs(cov - 0.35) / 0.35, 1.0)
         return clamp01(0.15 + 0.85 * score)
     except Exception:
@@ -394,24 +455,24 @@ def compute_garment_score(garment_rgba: Image.Image) -> float:
 
 
 # ─────────────────────────────
-# Gemini description (optional; safe) - NEW SDK
+# GEMINI DESCRIPTION
 # ─────────────────────────────
 def gemini_describe(garment_rgba: Image.Image) -> str:
     if not gemini_client:
         return "dress"
     try:
+        from google.genai import types
+        
         prompt = "Describe this garment in 1 sentence: type, color, pattern, style."
-
         buf = io.BytesIO()
         garment_rgba.save(buf, format="PNG")
         img_part = types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png")
-
-        # Note: order [prompt, image] or [image, prompt] both typically work.
+        
         resp = gemini_client.models.generate_content(
             model=GEMINI_MODEL_ID,
             contents=[prompt, img_part],
         )
-
+        
         txt = (getattr(resp, "text", None) or "").strip()
         return txt if txt else "dress"
     except Exception:
@@ -419,51 +480,53 @@ def gemini_describe(garment_rgba: Image.Image) -> str:
 
 
 # ─────────────────────────────
-# Overlay fallback (preview)
+# OVERLAY FALLBACK
 # ─────────────────────────────
 def overlay(user_bgr: np.ndarray, garment_rgba: Image.Image) -> np.ndarray:
     out = user_bgr.copy()
     h, w = out.shape[:2]
     g_w, g_h = garment_rgba.size
-
+    
     target_w = int(w * 0.55)
     scale = target_w / max(1, g_w)
     new_w = max(1, int(g_w * scale))
     new_h = max(1, int(g_h * scale))
-
+    
     g = garment_rgba.resize((new_w, new_h), Image.LANCZOS)
-
+    
     x0 = (w - new_w) // 2
     y0 = int(h * 0.18)
     x1 = min(w, x0 + new_w)
     y1 = min(h, y0 + new_h)
-
+    
     if x1 <= x0 or y1 <= y0:
         return out
-
-    g_np = np.array(g.crop((0, 0, x1 - x0, y1 - y0)))  # RGBA
+    
+    g_np = np.array(g.crop((0, 0, x1 - x0, y1 - y0)))
     alpha = (g_np[:, :, 3:4].astype(np.float32)) / 255.0
     g_bgr = g_np[:, :, :3][:, :, ::-1].astype(np.float32)
-
+    
     region = out[y0:y1, x0:x1].astype(np.float32)
     out[y0:y1, x0:x1] = (region * (1 - alpha) + g_bgr * alpha).astype(np.uint8)
     return out
 
 
 # ─────────────────────────────
-# IDM-VTON generation (Replicate) + safe wrapper
+# IDM-VTON GENERATION
 # ─────────────────────────────
 def idm_vton_generate(person_pil: Image.Image, garment_pil: Image.Image, desc: str) -> Image.Image:
     if not idm_vton_ready:
         raise RuntimeError("IDM-VTON not enabled")
-
+    
+    import replicate
+    
     person_bytes = io.BytesIO()
     garment_bytes = io.BytesIO()
     person_pil.save(person_bytes, format="PNG")
     garment_pil.save(garment_bytes, format="PNG")
     person_bytes.seek(0)
     garment_bytes.seek(0)
-
+    
     out = replicate.run(
         "cuuupid/idm-vton:c871bb9b046607b680449ecbae55fd8c6d945e0a1948644bf2361b3d021d3ff4",
         input={
@@ -475,14 +538,14 @@ def idm_vton_generate(person_pil: Image.Image, garment_pil: Image.Image, desc: s
             "seed": 42,
         },
     )
-
+    
     if hasattr(out, "read"):
         return Image.open(io.BytesIO(out.read())).convert("RGB")
-
+    
     if isinstance(out, str):
         img_data = requests.get(out, timeout=180).content
         return Image.open(io.BytesIO(img_data)).convert("RGB")
-
+    
     if isinstance(out, list) and out:
         item = out[0]
         if hasattr(item, "read"):
@@ -490,7 +553,7 @@ def idm_vton_generate(person_pil: Image.Image, garment_pil: Image.Image, desc: s
         if isinstance(item, str):
             img_data = requests.get(item, timeout=180).content
             return Image.open(io.BytesIO(img_data)).convert("RGB")
-
+    
     raise RuntimeError(f"Unexpected Replicate output: {type(out)}")
 
 def safe_idm_vton_generate(person_pil: Image.Image, garment_pil: Image.Image, desc: str, attempts: int = 2) -> Image.Image:
@@ -504,21 +567,19 @@ def safe_idm_vton_generate(person_pil: Image.Image, garment_pil: Image.Image, de
 
 
 # ─────────────────────────────
-# Scoring (swap + overall confidence)
+# SCORING
 # ─────────────────────────────
 def compute_swap_score(mode_used: str, pose_score: float, garment_score: float, diagnostics: Dict[str, Any]) -> float:
     score = 0.60 * pose_score + 0.40 * garment_score
-
-    # Penalize overlay vs IDM (overlay is preview)
+    
     if mode_used.startswith("overlay"):
         score *= 0.85
-
-    # Penalize profile / low-res
+    
     if diagnostics.get("orientation") == "profile_or_turned":
         score *= 0.80
     if diagnostics.get("low_resolution"):
         score *= 0.85
-
+    
     return clamp01(score)
 
 def compute_overall_confidence(can_tryon: bool, pose_score: float, garment_score: float, swap_score: float) -> float:
@@ -528,7 +589,7 @@ def compute_overall_confidence(can_tryon: bool, pose_score: float, garment_score
 
 
 # ─────────────────────────────
-# Unified response builder
+# RESPONSE BUILDER
 # ─────────────────────────────
 def make_response(
     request: Request,
@@ -548,15 +609,15 @@ def make_response(
     output_urls: List[str] = []
     output_download_urls: List[str] = []
     output_view_urls: List[str] = []
-
+    
     if out_bgr is not None:
         fname = f"tryon_{uuid.uuid4().hex[:10]}.jpg"
         save_bgr_jpg(os.path.join(OUTPUT_DIR, fname), out_bgr)
-
+        
         output_urls = [build_url(request, fname)]
         output_download_urls = [build_download_url(request, fname)]
         output_view_urls = [build_view_url(request, fname)]
-
+    
     return {
         "request_id": request_id,
         "can_tryon": can_tryon,
@@ -577,10 +638,15 @@ def make_response(
     }
 
 
+# ─────────────────────────────
+# HEALTH CHECK
+# ─────────────────────────────
+@app.get("/")
 @app.get("/health")
 def health():
     return {
         "ok": True,
+        "status": "healthy",
         "gemini_enabled": bool(gemini_client),
         "idm_vton_enabled": bool(idm_vton_ready),
         "apis": ["/v1/tryon/actress-to-user", "/v1/tryon/garment-to-user"],
@@ -588,7 +654,7 @@ def health():
 
 
 # ─────────────────────────────
-# Core pipeline (single entry)
+# CORE PIPELINE
 # ─────────────────────────────
 def run_pipeline(
     request: Request,
@@ -596,13 +662,12 @@ def run_pipeline(
     garment_bgr: np.ndarray,
     garment_des: str,
     prefer_idm: bool,
-    mode_hint: str,  # "garment" or "actress"
+    mode_hint: str,
 ) -> Dict[str, Any]:
     request_id = getattr(request.state, "request_id", uuid.uuid4().hex[:12])
     diagnostics = build_input_diagnostics(user_bgr)
-
+    
     try:
-        # Gating
         if not diagnostics.get("person_detected", False):
             warnings = ["No person detected clearly. Upload a clear upper/full-body photo."]
             if diagnostics.get("face_detected", False):
@@ -611,7 +676,7 @@ def run_pipeline(
                 request, request_id, False, "input_invalid_user", garment_des.strip() or "garment",
                 0.0, 0.0, 0.0, 0.0, warnings, diagnostics
             )
-
+        
         if diagnostics.get("body_coverage") == "tiny_person":
             return make_response(
                 request, request_id, False, "input_person_too_small", garment_des.strip() or "garment",
@@ -619,25 +684,20 @@ def run_pipeline(
                 ["Person appears very small/far. Upload a closer upper/full-body photo."],
                 diagnostics,
             )
-
+        
         if diagnostics.get("orientation") == "profile_or_turned":
             prefer_idm = False
-
-        # Crop user for consistent processing
+        
         user_crop = crop_person(user_bgr)
-
-        # Pose assessment
         pa = assess_pose(user_crop)
         pose_score = pa.score
-
-        # Garment cutout
+        
         garment_rgba, cutout_warnings = garment_cutout_rgba_safe(garment_bgr)
         garment_score = compute_garment_score(garment_rgba)
-
+        
         desc = garment_des.strip() or (gemini_describe(garment_rgba) if gemini_client else "dress")
         warnings = list(pa.reasons) + cutout_warnings
-
-        # If pose not detected: overlay-only if bbox exists
+        
         if not pa.pose_detected:
             if get_person_bbox(user_crop) is not None:
                 out_bgr = overlay(user_crop, garment_rgba)
@@ -650,44 +710,41 @@ def run_pipeline(
                     pose_score, garment_score, swap_score, overall,
                     warnings, diagnostics, out_bgr=out_bgr
                 )
-
+            
             warnings.append("No person detected clearly after crop.")
             return make_response(
                 request, request_id, False, "no_pose_no_person", desc,
                 pose_score, garment_score, 0.0, 0.0,
                 warnings, diagnostics
             )
-
-        # Low-res: avoid IDM
+        
         if diagnostics.get("low_resolution", False):
             prefer_idm = False
             warnings.append("Low resolution detected; using overlay preview.")
-
-        # Decide IDM
+        
         idm_allowed = bool(prefer_idm) and idm_vton_ready and pa.ok_for_idm
-
+        
         if idm_allowed:
             try:
                 white = Image.new("RGBA", garment_rgba.size, (255, 255, 255, 255))
                 garment_rgb = Image.alpha_composite(white, garment_rgba).convert("RGB")
-
+                
                 out_pil = safe_idm_vton_generate(bgr_to_pil(user_crop), garment_rgb, desc, attempts=2)
                 out_bgr = cv2.cvtColor(np.array(out_pil), cv2.COLOR_RGB2BGR)
-
+                
                 mode_used = "idm-vton"
                 swap_score = compute_swap_score(mode_used, pose_score, garment_score, diagnostics)
                 overall = compute_overall_confidence(True, pose_score, garment_score, swap_score)
-
+                
                 return make_response(
                     request, request_id, True, mode_used, desc,
                     pose_score, garment_score, swap_score, overall,
                     warnings, diagnostics, out_bgr=out_bgr
                 )
-
+            
             except Exception as e:
                 warnings.append(f"IDM-VTON failed; using overlay fallback: {type(e).__name__}")
-
-        # Overlay path
+        
         if pa.ok_for_overlay:
             mode_used = "overlay"
             if prefer_idm and idm_vton_ready and not pa.ok_for_idm:
@@ -695,27 +752,27 @@ def run_pipeline(
             if diagnostics.get("orientation") == "profile_or_turned":
                 mode_used = "overlay_profile"
                 warnings.append("Profile/turned detected; overlay may be less accurate. Use front-facing photo.")
-
+            
             out_bgr = overlay(user_crop, garment_rgba)
             swap_score = compute_swap_score(mode_used, pose_score, garment_score, diagnostics)
             overall = compute_overall_confidence(True, pose_score, garment_score, swap_score)
-
+            
             return make_response(
                 request, request_id, True, mode_used, desc,
                 pose_score, garment_score, swap_score, overall,
                 warnings, diagnostics, out_bgr=out_bgr
             )
-
+        
         warnings.append("Pose detected but too weak for overlay; use front-facing photo with shoulders visible.")
         return make_response(
             request, request_id, False, "pose_too_weak", desc,
             pose_score, garment_score, 0.0, 0.0,
             warnings, diagnostics
         )
-
+    
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[{request_id}] Pipeline crash: {type(e).__name__}: {e}\n{tb}")
+        print(f"[{request_id}] Pipeline crash: {type(e).__name__}: {e}\n{tb}", file=sys.stderr, flush=True)
         return make_response(
             request, request_id, False, "internal_error_safe", garment_des.strip() or "garment",
             0.0, 0.0, 0.0, 0.0,
@@ -726,7 +783,7 @@ def run_pipeline(
 
 
 # ─────────────────────────────
-# Endpoints
+# API ENDPOINTS
 # ─────────────────────────────
 @app.post("/v1/tryon/garment-to-user")
 async def garment_to_user(
@@ -753,7 +810,7 @@ async def garment_to_user(
                 error={"type": type(e).__name__, "message": "Image decode failed"},
             ),
         )
-
+    
     return await anyio.to_thread.run_sync(
         run_pipeline,
         request,
@@ -790,9 +847,9 @@ async def actress_to_user(
                 error={"type": type(e).__name__, "message": "Image decode failed"},
             ),
         )
-
+    
     actress_crop = crop_person(actress_bgr)
-
+    
     return await anyio.to_thread.run_sync(
         run_pipeline,
         request,
@@ -805,13 +862,13 @@ async def actress_to_user(
 
 
 # ─────────────────────────────
-# Global exception handler (stable JSON)
+# GLOBAL EXCEPTION HANDLER
 # ─────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     request_id = getattr(request.state, "request_id", uuid.uuid4().hex[:12])
     tb = traceback.format_exc()
-    print(f"[{request_id}] Unhandled exception: {type(exc).__name__}: {exc}\n{tb}")
+    print(f"[{request_id}] Unhandled exception: {type(exc).__name__}: {exc}\n{tb}", file=sys.stderr, flush=True)
     return JSONResponse(
         status_code=200,
         content=make_response(
@@ -824,14 +881,25 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ─────────────────────────────
+# MAIN ENTRY POINT
+# ─────────────────────────────
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
-    print(f"✅ Starting FastAPI on http://0.0.0.0:{port}")
-    uvicorn.run(
-        "backend_gemini_overlay:app", 
-        host="0.0.0.0", 
-        port=port, 
-        reload=False,  # Disable reload in production
-        log_level="info"
-    )
-
+    print("=" * 60, file=sys.stderr, flush=True)
+    print(f"🚀 Starting Uvicorn on http://0.0.0.0:{port}", file=sys.stderr, flush=True)
+    print("=" * 60, file=sys.stderr, flush=True)
+    
+    try:
+        uvicorn.run(
+            "backend_gemini_overlay:app",
+            host="0.0.0.0",
+            port=port,
+            reload=False,
+            log_level="info",
+            access_log=True,
+        )
+    except Exception as e:
+        print(f"❌ Uvicorn failed to start: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.exit(1)
