@@ -16,7 +16,10 @@ import requests
 import numpy as np
 import cv2
 from PIL import Image
+from google import genai
+from google.genai import types
 
+import replicate
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
@@ -903,3 +906,4 @@ if __name__ == "__main__":
         print(f"❌ Uvicorn failed to start: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         traceback.print_exc()
         sys.exit(1)
+
