@@ -834,4 +834,5 @@ async def global_exception_handler(request: Request, exc: Exception):
 # Keeping this block is fine but not necessary.
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+    uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=port, log_level="info")
+
