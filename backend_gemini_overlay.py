@@ -83,10 +83,9 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestIdMiddleware)
 
 # ─────────────────────────────
-# MediaPipe VALIDATION HELPERS (NEW)
+# MediaPipe VALIDATION HELPERS
 # ─────────────────────────────
 def _is_real_mediapipe(mp_module: Any) -> bool:
-    # Real mediapipe exposes mp.solutions
     return bool(getattr(mp_module, "solutions", None))
 
 def _mp_debug(mp_module: Any) -> str:
@@ -135,8 +134,6 @@ class ModelStore:
         self._mp_validated = True
 
         if not _is_real_mediapipe(mp):
-            # This is your current error: AttributeError: module 'mediapipe' has no attribute 'solutions'
-            # We do NOT crash the server; just mark mediapipe unusable.
             self._mp_ok = False
             self._mp = None
             msg = f"⚠️ Invalid mediapipe module loaded. {_mp_debug(mp)}"
@@ -200,7 +197,6 @@ async def warmup_models():
     DOES NOT block port binding.
     """
     def _warm():
-        # Warmup should never fail the service.
         try:
             models.yolo()
         except Exception as e:
@@ -210,7 +206,6 @@ async def warmup_models():
             models.mp_pose()
             models.face_det()
         except Exception as e:
-            # This is where mediapipe error will land; we skip it safely.
             print(f"⚠️ MediaPipe warmup skipped: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
         try:
@@ -378,7 +373,6 @@ def detect_face(bgr: np.ndarray) -> Dict[str, Any]:
         found = bool(res.detections)
         return {"face_detected": found, "face_count": len(res.detections) if found else 0}
     except Exception:
-        # if mediapipe unavailable, gracefully return "no face"
         return {"face_detected": False, "face_count": 0}
 
 def estimate_orientation_from_pose(bgr: np.ndarray) -> str:
@@ -397,7 +391,6 @@ def estimate_orientation_from_pose(bgr: np.ndarray) -> str:
         diff = abs(ls - rs) + abs(lh - rh)
         return "profile_or_turned" if diff > 0.9 else "frontish"
     except Exception:
-        # if mediapipe unavailable, don't block pipeline
         return "unknown"
 
 def estimate_body_coverage(bgr: np.ndarray) -> Dict[str, Any]:
@@ -449,7 +442,6 @@ def assess_pose(user_bgr: np.ndarray) -> PoseAssessment:
         rgb = cv2.cvtColor(user_bgr, cv2.COLOR_BGR2RGB)
         res = pose.process(rgb)
     except Exception as e:
-        # If mediapipe is invalid/unavailable, don't crash service; just degrade
         return PoseAssessment(False, False, False, 0.15, [f"Pose estimation unavailable: {type(e).__name__}."])
 
     if not res.pose_landmarks:
@@ -504,7 +496,7 @@ def compute_garment_score(garment_rgba: Image.Image) -> float:
         return 0.25
 
 # ─────────────────────────────
-# GEMINI DESCRIPTION (unchanged)
+# GEMINI DESCRIPTION
 # ─────────────────────────────
 def gemini_describe(garment_rgba: Image.Image) -> str:
     if not gemini_client:
@@ -522,7 +514,7 @@ def gemini_describe(garment_rgba: Image.Image) -> str:
         return "dress"
 
 # ─────────────────────────────
-# OVERLAY (unchanged)
+# OVERLAY
 # ─────────────────────────────
 def overlay(user_bgr: np.ndarray, garment_rgba: Image.Image) -> np.ndarray:
     out = user_bgr.copy()
@@ -547,7 +539,7 @@ def overlay(user_bgr: np.ndarray, garment_rgba: Image.Image) -> np.ndarray:
     return out
 
 # ─────────────────────────────
-# IDM-VTON GENERATION (unchanged)
+# IDM-VTON GENERATION
 # ─────────────────────────────
 def idm_vton_generate(person_pil: Image.Image, garment_pil: Image.Image, desc: str) -> Image.Image:
     if not idm_vton_ready:
@@ -599,7 +591,7 @@ def safe_idm_vton_generate(person_pil: Image.Image, garment_pil: Image.Image, de
     raise last_err if last_err else RuntimeError("IDM-VTON failed")
 
 # ─────────────────────────────
-# SCORING + RESPONSE (unchanged)
+# SCORING + RESPONSE
 # ─────────────────────────────
 def compute_swap_score(mode_used: str, pose_score: float, garment_score: float, diagnostics: Dict[str, Any]) -> float:
     score = 0.60 * pose_score + 0.40 * garment_score
@@ -853,7 +845,7 @@ async def actress_to_user(
                 0.0, 0.0, 0.0, 0.0,
                 ["Failed to read/parse images. Upload valid JPG/PNG images."],
                 {},
-                error={"type": type(e).__name__", "message": "Image decode failed"},
+                error={"type": type(e).__name__, "message": "Image decode failed"},
             ),
         )
 
