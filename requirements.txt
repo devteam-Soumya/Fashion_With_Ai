@@ -8,11 +8,12 @@ Pillow
 requests
 replicate
 ultralytics
-mediapipe>=0.10.14
+mediapipe
 rembg
 onnxruntime
 streamlit
 google-genai
+
 
 
 
