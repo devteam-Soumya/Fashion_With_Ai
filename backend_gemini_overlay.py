@@ -1,7 +1,5 @@
 # backend_gemini_overlay.py
-# Virtual Try-On – Hardened (Refactored + Scores) — Render-safe
-# ✅ Fix: do NOT load YOLO/MediaPipe at import time (bind port first)
-# ✅ Fix: MediaPipe safety — handle wrong/invalid mediapipe module gracefully
+# Virtual Try-On – Hardened (Refactored + Scores) — Render-safe + MediaPipe-safe
 
 import os
 import io
@@ -57,7 +55,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 REPLICATE_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
 GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "gemini-2.5-flash")
 
-# Set YOLO config to writable location
+# YOLO config in writable place
 YOLO_CONFIG_DIR = os.getenv("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
 os.makedirs(YOLO_CONFIG_DIR, exist_ok=True)
 os.environ["YOLO_CONFIG_DIR"] = YOLO_CONFIG_DIR
@@ -66,7 +64,7 @@ print(f"✅ YOLO config dir: {YOLO_CONFIG_DIR}", file=sys.stderr, flush=True)
 # ─────────────────────────────
 # INITIALIZE FASTAPI APP
 # ─────────────────────────────
-app = FastAPI(title="Virtual Try-On – Hardened (Refactored + Scores) — Render Safe")
+app = FastAPI(title="Virtual Try-On – Render Safe (MediaPipe Safe)")
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 print("✅ FastAPI app created", file=sys.stderr, flush=True)
 
@@ -83,33 +81,27 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestIdMiddleware)
 
 # ─────────────────────────────
-# MediaPipe VALIDATION HELPERS
-# ─────────────────────────────
-def _is_real_mediapipe(mp_module: Any) -> bool:
-    return bool(getattr(mp_module, "solutions", None))
-
-def _mp_debug(mp_module: Any) -> str:
-    return f"file={getattr(mp_module,'__file__',None)} version={getattr(mp_module,'__version__',None)} has_solutions={hasattr(mp_module,'solutions')}"
-
-# ─────────────────────────────
-# LAZY MODEL STORE (Render-safe)
+# LAZY MODEL STORE (Render-safe + MediaPipe-safe)
 # ─────────────────────────────
 class ModelStore:
     """
     Lazily loads heavy ML deps so Uvicorn can bind port immediately.
-    Thread-safe for first-load.
+    Also protects against broken mediapipe imports (no .solutions).
     """
     def __init__(self):
         self._lock = threading.Lock()
         self._yolo = None
+
         self._mp = None
+        self._mp_ok = None  # cached bool: mediapipe usable?
+
         self._mp_pose = None
         self._pose = None
+
         self._mp_face = None
         self._face_det = None
+
         self._remove = None
-        self._mp_validated = False
-        self._mp_ok = False
 
     def yolo(self):
         with self._lock:
@@ -120,34 +112,49 @@ class ModelStore:
                 print("✅ YOLO loaded", file=sys.stderr, flush=True)
             return self._yolo
 
-    def _load_mediapipe(self):
+    # ---- MediaPipe safe import & validation ----
+    def _load_mediapipe(self) -> Optional[Any]:
         """
-        Safely load mediapipe. If a wrong/stub module is installed or shadowed,
-        keep service running and raise a friendly error only when pose/face is used.
+        Returns mediapipe module if valid, else None.
+        Valid means: import works AND module has attribute 'solutions'
         """
-        if self._mp_validated:
-            if not self._mp_ok:
-                raise RuntimeError("MediaPipe unavailable (invalid module loaded).")
+        if self._mp_ok is False:
+            return None
+        if self._mp is not None and self._mp_ok is True:
             return self._mp
 
-        import mediapipe as mp  # lazy import
-        self._mp_validated = True
-
-        if not _is_real_mediapipe(mp):
+        try:
+            import mediapipe as mp
+            # common failure: local mediapipe.py shadowing package
+            if not hasattr(mp, "solutions"):
+                self._mp_ok = False
+                print(
+                    "⚠️ MediaPipe imported but missing `solutions`. "
+                    "Likely a shadowing file/folder named mediapipe or a broken install. "
+                    "Disabling Pose/Face features.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return None
+            self._mp = mp
+            self._mp_ok = True
+            print("✅ MediaPipe available", file=sys.stderr, flush=True)
+            return self._mp
+        except Exception as e:
             self._mp_ok = False
-            self._mp = None
-            msg = f"⚠️ Invalid mediapipe module loaded. {_mp_debug(mp)}"
-            print(msg, file=sys.stderr, flush=True)
-            raise RuntimeError("MediaPipe unavailable (invalid module).")
-
-        self._mp_ok = True
-        self._mp = mp
-        print(f"✅ MediaPipe validated. {_mp_debug(mp)}", file=sys.stderr, flush=True)
-        return self._mp
+            print(
+                f"⚠️ MediaPipe import failed ({type(e).__name__}: {e}). "
+                "Disabling Pose/Face features.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
 
     def mp_pose(self):
         with self._lock:
             mp = self._load_mediapipe()
+            if mp is None:
+                return None, None
 
             if self._pose is None or self._mp_pose is None:
                 print("📥 Lazy-loading MediaPipe Pose...", file=sys.stderr, flush=True)
@@ -158,12 +165,13 @@ class ModelStore:
                     enable_segmentation=False,
                 )
                 print("✅ MediaPipe Pose loaded", file=sys.stderr, flush=True)
-
             return self._mp_pose, self._pose
 
     def face_det(self):
         with self._lock:
             mp = self._load_mediapipe()
+            if mp is None:
+                return None
 
             if self._face_det is None or self._mp_face is None:
                 print("📥 Lazy-loading MediaPipe Face Detection...", file=sys.stderr, flush=True)
@@ -173,7 +181,6 @@ class ModelStore:
                     min_detection_confidence=0.5,
                 )
                 print("✅ MediaPipe Face Detection loaded", file=sys.stderr, flush=True)
-
             return self._face_det
 
     def rembg_remove(self):
@@ -198,22 +205,21 @@ async def warmup_models():
     """
     def _warm():
         try:
+            # Warm YOLO + rembg (fast enough usually)
             models.yolo()
-        except Exception as e:
-            print(f"⚠️ YOLO warmup skipped: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            models.rembg_remove()
 
-        try:
+            # Warm MediaPipe only if valid
             models.mp_pose()
             models.face_det()
-        except Exception as e:
-            print(f"⚠️ MediaPipe warmup skipped: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
-        try:
-            models.rembg_remove()
+            print("✅ Warmup complete", file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"⚠️ rembg warmup skipped: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-
-        print("✅ Warmup thread finished (service runs).", file=sys.stderr, flush=True)
+            print(
+                f"⚠️ Warmup failed (service still runs): {type(e).__name__}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     threading.Thread(target=_warm, daemon=True).start()
 
@@ -241,7 +247,7 @@ if ENABLE_IDM_VTON:
         print("⚠️ IDM-VTON requested but REPLICATE_API_TOKEN missing. Disabling IDM-VTON.", file=sys.stderr, flush=True)
     else:
         try:
-            import replicate
+            import replicate  # noqa: F401
             os.environ["REPLICATE_API_TOKEN"] = REPLICATE_TOKEN
             idm_vton_ready = True
             print("✅ IDM-VTON enabled via Replicate", file=sys.stderr, flush=True)
@@ -251,7 +257,7 @@ else:
     print("ℹ️ IDM-VTON disabled (overlay only)", file=sys.stderr, flush=True)
 
 # ─────────────────────────────
-# UTILITY FUNCTIONS
+# UTILITY
 # ─────────────────────────────
 def clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
@@ -283,7 +289,7 @@ def build_view_url(request: Request, filename: str) -> str:
     return f"{base}/view/{filename}"
 
 # ─────────────────────────────
-# ENDPOINTS: DOWNLOAD & VIEW
+# DOWNLOAD & VIEW
 # ─────────────────────────────
 @app.get("/download/{filename}")
 def download_output(request: Request, filename: str):
@@ -327,7 +333,7 @@ def view_output(request: Request, filename: str):
     return HTMLResponse(html)
 
 # ─────────────────────────────
-# DETECTION HELPERS (use lazy models)
+# DETECTION HELPERS
 # ─────────────────────────────
 def get_person_bbox(bgr: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     try:
@@ -366,8 +372,12 @@ def crop_person(bgr: np.ndarray) -> np.ndarray:
     return crop if crop.size else bgr
 
 def detect_face(bgr: np.ndarray) -> Dict[str, Any]:
+    face_det = models.face_det()
+    if face_det is None:
+        # mediapipe disabled
+        return {"face_detected": False, "face_count": 0, "note": "mediapipe_disabled"}
+
     try:
-        face_det = models.face_det()
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         res = face_det.process(rgb)
         found = bool(res.detections)
@@ -376,8 +386,11 @@ def detect_face(bgr: np.ndarray) -> Dict[str, Any]:
         return {"face_detected": False, "face_count": 0}
 
 def estimate_orientation_from_pose(bgr: np.ndarray) -> str:
+    mp_pose, pose = models.mp_pose()
+    if mp_pose is None or pose is None:
+        return "unknown"  # mediapipe disabled
+
     try:
-        mp_pose, pose = models.mp_pose()
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         res = pose.process(rgb)
         if not res.pose_landmarks:
@@ -426,7 +439,7 @@ def build_input_diagnostics(bgr: np.ndarray) -> Dict[str, Any]:
     }
 
 # ─────────────────────────────
-# POSE ASSESSMENT (lazy pose)
+# POSE ASSESSMENT
 # ─────────────────────────────
 @dataclass
 class PoseAssessment:
@@ -437,12 +450,22 @@ class PoseAssessment:
     reasons: List[str]
 
 def assess_pose(user_bgr: np.ndarray) -> PoseAssessment:
+    mp_pose, pose = models.mp_pose()
+    if mp_pose is None or pose is None:
+        # mediapipe disabled -> fallback: allow overlay, block idm
+        return PoseAssessment(
+            pose_detected=False,
+            ok_for_idm=False,
+            ok_for_overlay=True,
+            score=0.40,
+            reasons=["MediaPipe unavailable; using overlay-only mode."],
+        )
+
     try:
-        mp_pose, pose = models.mp_pose()
         rgb = cv2.cvtColor(user_bgr, cv2.COLOR_BGR2RGB)
         res = pose.process(rgb)
-    except Exception as e:
-        return PoseAssessment(False, False, False, 0.15, [f"Pose estimation unavailable: {type(e).__name__}."])
+    except Exception:
+        return PoseAssessment(False, False, False, 0.15, ["Pose estimation failed internally."])
 
     if not res.pose_landmarks:
         return PoseAssessment(False, False, False, 0.20, ["No pose detected (use clearer, front-facing photo)."])
@@ -471,7 +494,7 @@ def assess_pose(user_bgr: np.ndarray) -> PoseAssessment:
     return PoseAssessment(True, shoulders_ok and hips_ok, shoulders_ok, score, reasons)
 
 # ─────────────────────────────
-# GARMENT PROCESSING (lazy rembg)
+# GARMENT PROCESSING
 # ─────────────────────────────
 def garment_cutout_rgba_safe(garment_bgr: np.ndarray) -> Tuple[Image.Image, List[str]]:
     warnings: List[str] = []
@@ -525,15 +548,18 @@ def overlay(user_bgr: np.ndarray, garment_rgba: Image.Image) -> np.ndarray:
     new_w = max(1, int(g_w * scale))
     new_h = max(1, int(g_h * scale))
     g = garment_rgba.resize((new_w, new_h), Image.LANCZOS)
+
     x0 = (w - new_w) // 2
     y0 = int(h * 0.18)
     x1 = min(w, x0 + new_w)
     y1 = min(h, y0 + new_h)
     if x1 <= x0 or y1 <= y0:
         return out
+
     g_np = np.array(g.crop((0, 0, x1 - x0, y1 - y0)))
     alpha = (g_np[:, :, 3:4].astype(np.float32)) / 255.0
     g_bgr = g_np[:, :, :3][:, :, ::-1].astype(np.float32)
+
     region = out[y0:y1, x0:x1].astype(np.float32)
     out[y0:y1, x0:x1] = (region * (1 - alpha) + g_bgr * alpha).astype(np.uint8)
     return out
@@ -664,7 +690,8 @@ def health():
         "status": "healthy",
         "gemini_enabled": bool(gemini_client),
         "idm_vton_enabled": bool(idm_vton_ready),
-        "note": "Render-safe: models are lazy-loaded; first request may be slower.",
+        "mediapipe_ok": True if models._mp_ok else False,
+        "note": "Render-safe: models lazy-load; first request may be slower.",
         "apis": ["/v1/tryon/actress-to-user", "/v1/tryon/garment-to-user"],
     }
 
@@ -687,16 +714,20 @@ def run_pipeline(
             warnings = ["No person detected clearly. Upload a clear upper/full-body photo."]
             if diagnostics.get("face_detected", False):
                 warnings = ["Face-only/selfie detected. Upload upper/full-body front-facing photo."]
-            return make_response(request, request_id, False, "input_invalid_user",
-                                 garment_des.strip() or "garment",
-                                 0.0, 0.0, 0.0, 0.0, warnings, diagnostics)
+            return make_response(
+                request, request_id, False, "input_invalid_user",
+                garment_des.strip() or "garment",
+                0.0, 0.0, 0.0, 0.0, warnings, diagnostics
+            )
 
         if diagnostics.get("body_coverage") == "tiny_person":
-            return make_response(request, request_id, False, "input_person_too_small",
-                                 garment_des.strip() or "garment",
-                                 0.0, 0.0, 0.0, 0.0,
-                                 ["Person appears very small/far. Upload a closer upper/full-body photo."],
-                                 diagnostics)
+            return make_response(
+                request, request_id, False, "input_person_too_small",
+                garment_des.strip() or "garment",
+                0.0, 0.0, 0.0, 0.0,
+                ["Person appears very small/far. Upload a closer upper/full-body photo."],
+                diagnostics
+            )
 
         if diagnostics.get("orientation") == "profile_or_turned":
             prefer_idm = False
@@ -710,22 +741,6 @@ def run_pipeline(
 
         desc = garment_des.strip() or (gemini_describe(garment_rgba) if gemini_client else "dress")
         warnings = list(pa.reasons) + cutout_warnings
-
-        if not pa.pose_detected:
-            if get_person_bbox(user_crop) is not None:
-                out_bgr = overlay(user_crop, garment_rgba)
-                warnings.append("Pose not detected; generated overlay preview only.")
-                mode_used = "overlay_no_pose"
-                swap_score = compute_swap_score(mode_used, pose_score, garment_score, diagnostics)
-                overall = compute_overall_confidence(True, pose_score, garment_score, swap_score)
-                return make_response(request, request_id, True, mode_used, desc,
-                                     pose_score, garment_score, swap_score, overall,
-                                     warnings, diagnostics, out_bgr=out_bgr)
-
-            warnings.append("No person detected clearly after crop.")
-            return make_response(request, request_id, False, "no_pose_no_person", desc,
-                                 pose_score, garment_score, 0.0, 0.0,
-                                 warnings, diagnostics)
 
         if diagnostics.get("low_resolution", False):
             prefer_idm = False
@@ -745,33 +760,25 @@ def run_pipeline(
                 swap_score = compute_swap_score(mode_used, pose_score, garment_score, diagnostics)
                 overall = compute_overall_confidence(True, pose_score, garment_score, swap_score)
 
-                return make_response(request, request_id, True, mode_used, desc,
-                                     pose_score, garment_score, swap_score, overall,
-                                     warnings, diagnostics, out_bgr=out_bgr)
-
+                return make_response(
+                    request, request_id, True, mode_used, desc,
+                    pose_score, garment_score, swap_score, overall,
+                    warnings, diagnostics, out_bgr=out_bgr
+                )
             except Exception as e:
                 warnings.append(f"IDM-VTON failed; using overlay fallback: {type(e).__name__}")
 
-        if pa.ok_for_overlay:
-            mode_used = "overlay"
-            if prefer_idm and idm_vton_ready and not pa.ok_for_idm:
-                mode_used = "overlay_pose_weak"
-            if diagnostics.get("orientation") == "profile_or_turned":
-                mode_used = "overlay_profile"
-                warnings.append("Profile/turned detected; overlay may be less accurate. Use front-facing photo.")
+        # overlay fallback
+        mode_used = "overlay"
+        out_bgr = overlay(user_crop, garment_rgba)
+        swap_score = compute_swap_score(mode_used, pose_score, garment_score, diagnostics)
+        overall = compute_overall_confidence(True, pose_score, garment_score, swap_score)
 
-            out_bgr = overlay(user_crop, garment_rgba)
-            swap_score = compute_swap_score(mode_used, pose_score, garment_score, diagnostics)
-            overall = compute_overall_confidence(True, pose_score, garment_score, swap_score)
-
-            return make_response(request, request_id, True, mode_used, desc,
-                                 pose_score, garment_score, swap_score, overall,
-                                 warnings, diagnostics, out_bgr=out_bgr)
-
-        warnings.append("Pose detected but too weak for overlay; use front-facing photo with shoulders visible.")
-        return make_response(request, request_id, False, "pose_too_weak", desc,
-                             pose_score, garment_score, 0.0, 0.0,
-                             warnings, diagnostics)
+        return make_response(
+            request, request_id, True, mode_used, desc,
+            pose_score, garment_score, swap_score, overall,
+            warnings, diagnostics, out_bgr=out_bgr
+        )
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -880,9 +887,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         ),
     )
 
-# IMPORTANT:
-# On Render, DO NOT run uvicorn here. Render already runs:
-# uvicorn backend_gemini_overlay:app --host 0.0.0.0 --port $PORT
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=port, log_level="info")
