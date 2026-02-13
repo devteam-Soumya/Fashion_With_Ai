@@ -1,20 +1,36 @@
-fastapi
-uvicorn
-python-multipart
-python-dotenv
-opencv-python
-numpy
-Pillow
-requests
-replicate
-ultralytics
-mediapipe
-rembg
-onnxruntime
-streamlit
-google-genai
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+starlette==0.37.2
+python-multipart==0.0.9
+anyio==4.3.0
 
+# HTTP
+requests==2.31.0
 
+# Image processing
+Pillow==10.3.0
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
 
+# ML — YOLO
+ultralytics==8.2.0
 
+# ML — MediaPipe Tasks API (>=0.10.14 has Tasks, no mp.solutions needed)
+mediapipe==0.10.14
 
+# Background removal
+rembg==2.0.50
+onnxruntime==1.17.3
+
+# Gemini (optional — comment out if not using)
+google-genai==0.5.0
+
+# Replicate / IDM-VTON (optional — comment out if not using)
+replicate==0.25.2
+
+# Env
+python-dotenv==1.0.1
+
+# absl (bundled with mediapipe but explicit pin avoids version conflicts)
+absl-py==2.1.0
