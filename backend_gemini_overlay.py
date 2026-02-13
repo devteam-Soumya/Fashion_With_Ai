@@ -1,6 +1,7 @@
 # backend_gemini_overlay.py
 # Virtual Try-On – Hardened (Refactored + Scores) — Render-safe
 # ✅ Fix: do NOT load YOLO/MediaPipe at import time (bind port first)
+# ✅ Fix: MediaPipe safety — handle wrong/invalid mediapipe module gracefully
 
 import os
 import io
@@ -82,6 +83,16 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestIdMiddleware)
 
 # ─────────────────────────────
+# MediaPipe VALIDATION HELPERS (NEW)
+# ─────────────────────────────
+def _is_real_mediapipe(mp_module: Any) -> bool:
+    # Real mediapipe exposes mp.solutions
+    return bool(getattr(mp_module, "solutions", None))
+
+def _mp_debug(mp_module: Any) -> str:
+    return f"file={getattr(mp_module,'__file__',None)} version={getattr(mp_module,'__version__',None)} has_solutions={hasattr(mp_module,'solutions')}"
+
+# ─────────────────────────────
 # LAZY MODEL STORE (Render-safe)
 # ─────────────────────────────
 class ModelStore:
@@ -98,6 +109,8 @@ class ModelStore:
         self._mp_face = None
         self._face_det = None
         self._remove = None
+        self._mp_validated = False
+        self._mp_ok = False
 
     def yolo(self):
         with self._lock:
@@ -108,28 +121,62 @@ class ModelStore:
                 print("✅ YOLO loaded", file=sys.stderr, flush=True)
             return self._yolo
 
+    def _load_mediapipe(self):
+        """
+        Safely load mediapipe. If a wrong/stub module is installed or shadowed,
+        keep service running and raise a friendly error only when pose/face is used.
+        """
+        if self._mp_validated:
+            if not self._mp_ok:
+                raise RuntimeError("MediaPipe unavailable (invalid module loaded).")
+            return self._mp
+
+        import mediapipe as mp  # lazy import
+        self._mp_validated = True
+
+        if not _is_real_mediapipe(mp):
+            # This is your current error: AttributeError: module 'mediapipe' has no attribute 'solutions'
+            # We do NOT crash the server; just mark mediapipe unusable.
+            self._mp_ok = False
+            self._mp = None
+            msg = f"⚠️ Invalid mediapipe module loaded. {_mp_debug(mp)}"
+            print(msg, file=sys.stderr, flush=True)
+            raise RuntimeError("MediaPipe unavailable (invalid module).")
+
+        self._mp_ok = True
+        self._mp = mp
+        print(f"✅ MediaPipe validated. {_mp_debug(mp)}", file=sys.stderr, flush=True)
+        return self._mp
+
     def mp_pose(self):
         with self._lock:
-            if self._mp is None:
-                import mediapipe as mp
-                self._mp = mp
+            mp = self._load_mediapipe()
+
             if self._pose is None or self._mp_pose is None:
                 print("📥 Lazy-loading MediaPipe Pose...", file=sys.stderr, flush=True)
-                self._mp_pose = self._mp.solutions.pose
-                self._pose = self._mp_pose.Pose(static_image_mode=True, model_complexity=1, enable_segmentation=False)
+                self._mp_pose = mp.solutions.pose
+                self._pose = self._mp_pose.Pose(
+                    static_image_mode=True,
+                    model_complexity=1,
+                    enable_segmentation=False,
+                )
                 print("✅ MediaPipe Pose loaded", file=sys.stderr, flush=True)
+
             return self._mp_pose, self._pose
 
     def face_det(self):
         with self._lock:
-            if self._mp is None:
-                import mediapipe as mp
-                self._mp = mp
+            mp = self._load_mediapipe()
+
             if self._face_det is None or self._mp_face is None:
                 print("📥 Lazy-loading MediaPipe Face Detection...", file=sys.stderr, flush=True)
-                self._mp_face = self._mp.solutions.face_detection
-                self._face_det = self._mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+                self._mp_face = mp.solutions.face_detection
+                self._face_det = self._mp_face.FaceDetection(
+                    model_selection=0,
+                    min_detection_confidence=0.5,
+                )
                 print("✅ MediaPipe Face Detection loaded", file=sys.stderr, flush=True)
+
             return self._face_det
 
     def rembg_remove(self):
@@ -153,15 +200,25 @@ async def warmup_models():
     DOES NOT block port binding.
     """
     def _warm():
+        # Warmup should never fail the service.
         try:
-            # Warm what you want; you can comment these if you want absolutely fastest start
             models.yolo()
+        except Exception as e:
+            print(f"⚠️ YOLO warmup skipped: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+        try:
             models.mp_pose()
             models.face_det()
-            models.rembg_remove()
-            print("✅ Warmup complete", file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"⚠️ Warmup failed (service still runs): {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            # This is where mediapipe error will land; we skip it safely.
+            print(f"⚠️ MediaPipe warmup skipped: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+        try:
+            models.rembg_remove()
+        except Exception as e:
+            print(f"⚠️ rembg warmup skipped: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+        print("✅ Warmup thread finished (service runs).", file=sys.stderr, flush=True)
 
     threading.Thread(target=_warm, daemon=True).start()
 
@@ -321,6 +378,7 @@ def detect_face(bgr: np.ndarray) -> Dict[str, Any]:
         found = bool(res.detections)
         return {"face_detected": found, "face_count": len(res.detections) if found else 0}
     except Exception:
+        # if mediapipe unavailable, gracefully return "no face"
         return {"face_detected": False, "face_count": 0}
 
 def estimate_orientation_from_pose(bgr: np.ndarray) -> str:
@@ -339,6 +397,7 @@ def estimate_orientation_from_pose(bgr: np.ndarray) -> str:
         diff = abs(ls - rs) + abs(lh - rh)
         return "profile_or_turned" if diff > 0.9 else "frontish"
     except Exception:
+        # if mediapipe unavailable, don't block pipeline
         return "unknown"
 
 def estimate_body_coverage(bgr: np.ndarray) -> Dict[str, Any]:
@@ -389,8 +448,9 @@ def assess_pose(user_bgr: np.ndarray) -> PoseAssessment:
         mp_pose, pose = models.mp_pose()
         rgb = cv2.cvtColor(user_bgr, cv2.COLOR_BGR2RGB)
         res = pose.process(rgb)
-    except Exception:
-        return PoseAssessment(False, False, False, 0.15, ["Pose estimation failed internally."])
+    except Exception as e:
+        # If mediapipe is invalid/unavailable, don't crash service; just degrade
+        return PoseAssessment(False, False, False, 0.15, [f"Pose estimation unavailable: {type(e).__name__}."])
 
     if not res.pose_landmarks:
         return PoseAssessment(False, False, False, 0.20, ["No pose detected (use clearer, front-facing photo)."])
@@ -617,7 +677,7 @@ def health():
     }
 
 # ─────────────────────────────
-# CORE PIPELINE (your same logic, unchanged)
+# CORE PIPELINE
 # ─────────────────────────────
 def run_pipeline(
     request: Request,
@@ -793,7 +853,7 @@ async def actress_to_user(
                 0.0, 0.0, 0.0, 0.0,
                 ["Failed to read/parse images. Upload valid JPG/PNG images."],
                 {},
-                error={"type": type(e).__name__, "message": "Image decode failed"},
+                error={"type": type(e).__name__", "message": "Image decode failed"},
             ),
         )
 
@@ -831,8 +891,6 @@ async def global_exception_handler(request: Request, exc: Exception):
 # IMPORTANT:
 # On Render, DO NOT run uvicorn here. Render already runs:
 # uvicorn backend_gemini_overlay:app --host 0.0.0.0 --port $PORT
-# Keeping this block is fine but not necessary.
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=port, log_level="info")
-
