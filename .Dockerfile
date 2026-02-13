@@ -1,41 +1,36 @@
-# Use slim Python image (much smaller than full python:3.11)
-FROM python:3.11-slim AS builder
-
-# Set working directory
-WORKDIR /app
-
-# Install system dependencies needed for opencv, rembg, mediapipe, etc.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy only requirements first (better caching)
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy the application code
-COPY backend_gemini_overlay.py .
-
-# Final stage – copy only what's needed
+# ── Base image ────────────────────────────────────────────────────────────────
+# python:3.11-slim avoids bloated full image while keeping build fast on Railway
 FROM python:3.11-slim
 
+# ── System dependencies ────────────────────────────────────────────────────────
+# libgl1 + libglib2.0-0 → required by OpenCV (cv2)
+# libgomp1             → required by ultralytics/YOLO
+# curl                 → health checks / debugging
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Working directory ─────────────────────────────────────────────────────────
 WORKDIR /app
 
-# Copy installed packages from builder
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+# ── Python deps ───────────────────────────────────────────────────────────────
+# Copy requirements first so Docker layer-caches the pip install
+# (only re-runs when requirements.txt changes, not on every code change)
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY backend_gemini_overlay.py .
+# ── App code ──────────────────────────────────────────────────────────────────
+COPY . .
 
-# Create outputs folder
-RUN mkdir -p /app/outputs
+# ── Output dir ────────────────────────────────────────────────────────────────
+RUN mkdir -p ./outputs /tmp/Ultralytics /tmp/mp_models /tmp/matplotlib
 
-# Expose FastAPI port
+# ── Expose port (Railway reads $PORT at runtime, this is just documentation) ──
 EXPOSE 8000
 
-# Run with uvicorn (production settings)
-CMD ["uvicorn", "backend_gemini_overlay:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# ── Start command ─────────────────────────────────────────────────────────────
+CMD uvicorn backend_gemini_overlay:app --host 0.0.0.0 --port ${PORT:-8000}
