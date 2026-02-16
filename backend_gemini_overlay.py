@@ -25,6 +25,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from dotenv import load_dotenv
 load_dotenv()
+from ultralytics import YOLO
+from rembg import remove
+import mediapipe as mp
 
 # ✅ NEW Gemini SDK (google-genai)
 from google import genai
@@ -831,4 +834,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8080"))
     uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=port, log_level="info")
+
 
