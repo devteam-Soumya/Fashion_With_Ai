@@ -823,7 +823,8 @@ async def global_exception_handler(request: Request, exc: Exception):
         ),
     )
 
-
 if __name__ == "__main__":
-    print("✅ Starting FastAPI on http://127.0.0.1:8000")
-    uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run("backend_gemini_overlay:app", host="0.0.0.0", port=port, log_level="info")
+
+
