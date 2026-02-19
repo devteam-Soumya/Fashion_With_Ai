@@ -4,7 +4,7 @@ import requests
 st.set_page_config(page_title="Virtual Try-On", layout="wide")
 st.title("Virtual Try-On – Gemini + IDM-VTON + Overlay Fallback")
 
-api_base = st.sidebar.text_input("Backend URL", "http://127.0.0.1:8000").rstrip("/")
+api_base = st.sidebar.text_input("Backend URL", "http://3.88.24.123:8000").rstrip("/")
 timeout = st.sidebar.slider("Timeout (s)", 30, 600, 240)
 prefer_idm = st.sidebar.checkbox("Prefer IDM-VTON (photorealistic)", value=True)
 
